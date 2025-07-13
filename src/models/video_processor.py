@@ -189,25 +189,36 @@ class VideoProcessor:
         start_time = time.time()
         
         self.logger.info(f"Worker {worker_id} processing: {video_url}")
+        self.logger.debug(f"_process_video: Starting processing for {video_url}")
         
         try:
             # Step 1: Download video
+            self.logger.debug(f"_process_video: Calling _download_video for {video_url}")
             download_result = self._download_video(video_url)
             if not download_result['success']:
+                self.logger.error(f"_process_video: Download failed for {video_url}: {download_result['error']}")
                 raise Exception(f"Download failed: {download_result['error']}")
+            self.logger.debug(f"_process_video: Download successful for {video_url}. Path: {download_result['video_path']}")
             
             # Step 2: Extract audio
+            self.logger.debug(f"_process_video: Calling _extract_audio for {download_result['video_path']}")
             audio_result = self._extract_audio(download_result['video_path'])
             if not audio_result['success']:
+                self.logger.error(f"_process_video: Audio extraction failed for {download_result['video_path']}: {audio_result['error']}")
                 raise Exception(f"Audio extraction failed: {audio_result['error']}")
+            self.logger.debug(f"_process_video: Audio extraction successful. Path: {audio_result['audio_path']}")
             
             # Step 3: Transcribe audio
+            self.logger.debug(f"_process_video: Calling _transcribe_audio for {audio_result['audio_path']}")
             transcription_result = self._transcribe_audio(audio_result['audio_path'])
             if not transcription_result['success']:
+                self.logger.error(f"_process_video: Transcription failed for {audio_result['audio_path']}: {transcription_result['error']}")
                 raise Exception(f"Transcription failed: {transcription_result['error']}")
+            self.logger.debug(f"_process_video: Transcription successful. TXT: {transcription_result['transcription_path']}, SRT: {transcription_result.get('srt_path')}, JSON: {transcription_result.get('json_path')}")
             
             # Step 4: Save to Google Drive (if enabled)
             if self.config.save_to_drive:
+                self.logger.debug(f"_process_video: Calling _save_to_drive for {video_url}")
                 drive_result = self._save_to_drive(
                     download_result['video_path'],
                     audio_result['audio_path'],
@@ -215,6 +226,10 @@ class VideoProcessor:
                     transcription_result.get('srt_path'),
                     transcription_result.get('json_path')
                 )
+                if not drive_result['success']:
+                    self.logger.error(f"_process_video: Saving to Drive failed for {video_url}: {drive_result['error']}")
+                    # Do not raise exception here, allow partial success if only drive save fails
+            self.logger.debug(f"_process_video: Save to Drive operation completed for {video_url}")
             
             # Create result
             processing_time = time.time() - start_time
@@ -240,12 +255,15 @@ class VideoProcessor:
                 self.completed_results.append(result)
             
             self.logger.info(f"Successfully processed: {video_url} (Time: {processing_time:.1f}s)")
+            self.logger.debug(f"_process_video: Finished processing for {video_url}")
             
         except Exception as e:
+            self.logger.error(f"_process_video: Caught exception during processing for {video_url}: {e}", exc_info=True)
             self._handle_processing_error(video_item, e)
     
     def _download_video(self, video_url: str) -> Dict[str, Any]:
         """Download video using yt-dlp"""
+        self.logger.debug(f"_download_video: Starting download for {video_url}")
         try:
             import yt_dlp
             
@@ -256,60 +274,95 @@ class VideoProcessor:
                 'quiet': True,
                 'no_warnings': True
             }
+            self.logger.debug(f"_download_video: yt-dlp options: {ydl_opts}")
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 # Get video info
+                self.logger.debug(f"_download_video: Extracting info for {video_url}")
                 info = ydl.extract_info(video_url, download=False)
                 video_title = info.get('title', 'Unknown')
+                self.logger.debug(f"_download_video: Video title: {video_title}")
                 
                 # Download video
+                self.logger.debug(f"_download_video: Initiating download for {video_url}")
                 ydl.download([video_url])
                 
-                # Find downloaded file
-                video_path = f"{self.config.output_dir}/{video_title}.mp4"
+                # Find downloaded file (yt-dlp might add id or other info)
+                # We need to be robust in finding the actual downloaded file name
+                downloaded_filename = ydl.prepare_filename(info)
+                # Adjust for potential .mp4 extension added by yt-dlp if original was different
+                video_path = Path(downloaded_filename).with_suffix('.mp4')
+                if not video_path.exists(): # Fallback if .mp4 wasn't the final extension
+                    # This is a bit tricky with yt-dlp as it can output various extensions
+                    # For now, let's assume it's mp4 or the original ext
+                    # A more robust solution might iterate through files in output_dir
+                    self.logger.warning(f"_download_video: Expected video_path {video_path} not found. Trying info.get('_filename').")
+                    video_path = Path(info.get('_filename', downloaded_filename))
+                    if not video_path.exists():
+                        # If still not found, search in output_dir
+                        for f in Path(self.config.output_dir).iterdir():
+                            if video_title in f.stem:
+                                video_path = f
+                                self.logger.debug(f"_download_video: Found video file by title search: {video_path}")
+                                break
+                
+                if not video_path.exists():
+                    raise FileNotFoundError(f"Downloaded video file not found at expected path: {video_path}")
+                
+                self.logger.debug(f"_download_video: Download complete. Video path: {video_path}")
                 
                 return {
                     'success': True,
-                    'video_path': video_path,
+                    'video_path': str(video_path),
                     'title': video_title
                 }
                 
         except Exception as e:
+            self.logger.error(f"_download_video: Error downloading video {video_url}: {e}", exc_info=True)
             return {
                 'success': False,
-                'error': str(e)
+                'error': str(e),
+                'video_path': None,
+                'title': None
             }
     
     def _extract_audio(self, video_path: str) -> Dict[str, Any]:
         """Extract audio from video"""
+        self.logger.debug(f"_extract_audio: Starting audio extraction for {video_path}")
         try:
             from moviepy.editor import VideoFileClip
             
             # Generate audio path
-            audio_path = video_path.replace('.mp4', '.wav')
+            audio_path = Path(video_path).with_suffix('.wav')
+            self.logger.debug(f"_extract_audio: Target audio path: {audio_path}")
             
             # Extract audio
             video = VideoFileClip(video_path)
             audio = video.audio
-            audio.write_audiofile(audio_path, verbose=False, logger=None)
+            self.logger.debug(f"_extract_audio: Writing audio file to {audio_path}")
+            audio.write_audiofile(str(audio_path), verbose=False, logger=None)
             
             # Clean up
             video.close()
             audio.close()
+            self.logger.debug(f"_extract_audio: Audio extraction complete for {video_path}")
             
             return {
                 'success': True,
-                'audio_path': audio_path
+                'audio_path': str(audio_path)
             }
             
         except Exception as e:
+            self.logger.error(f"_extract_audio: Error extracting audio from {video_path}: {e}", exc_info=True)
             return {
                 'success': False,
-                'error': str(e)
+                'error': str(e),
+                'audio_path': None
             }
     
     def _transcribe_audio(self, audio_path: str) -> Dict[str, Any]:
         """Transcribe audio using WhisperX and generate SRT/JSON with alignment"""
+        self.logger.debug(f"_transcribe_audio: Starting transcription for {audio_path}")
         try:
             import torch # Import torch here for multithreaded context
             import whisperx
@@ -317,23 +370,26 @@ class VideoProcessor:
             
             # Load Whisper model
             # Using smaller model for alignment is often sufficient and faster
-            whisper_model_name = "base" # This can be configured if needed
+            whisper_model_name = self.config.whisper_model # Use configured model size
             whisper_batch_size = 8 # This can be configured if needed
             
             self.logger.info(f"Loading WhisperX model: {whisper_model_name} on device: cuda, compute_type: {self.config.compute_type}")
             model = whisperx.load_model(whisper_model_name, "cuda", compute_type=self.config.compute_type)
 
             # Load audio
+            self.logger.debug(f"_transcribe_audio: Loading audio with whisperx for {audio_path}")
             audio = whisperx.load_audio(audio_path)
 
             # Transcribe audio
             self.logger.info("Transcribing audio with WhisperX...")
             result = model.transcribe(audio, batch_size=whisper_batch_size, language=self.config.language)
+            self.logger.debug(f"_transcribe_audio: Initial transcription complete. Detected language: {result.get('language')}")
             
             # Clear whisper model from GPU memory
             del model
             gc.collect()
             torch.cuda.empty_cache()
+            self.logger.debug(f"_transcribe_audio: Cleared Whisper model from GPU memory.")
 
             # Load alignment model and metadata
             self.logger.info(f"Loading alignment model for language: {result['language']}")
@@ -342,23 +398,28 @@ class VideoProcessor:
             # Align word timestamps
             self.logger.info("Aligning word timestamps...")
             aligned_result = whisperx.align(result["segments"], align_model, metadata, audio, "cuda", return_char_alignments=False)
+            self.logger.debug(f"_transcribe_audio: Word alignment complete.")
             
             # Clear alignment model from GPU memory
             del align_model
             gc.collect()
             torch.cuda.empty_cache()
+            self.logger.debug(f"_transcribe_audio: Cleared alignment model from GPU memory.")
             
             base_name = Path(audio_path).stem
             output_dir = Path(self.config.output_dir)
-            
+            output_dir.mkdir(parents=True, exist_ok=True) # Ensure output directory exists
+
             # Save transcription (text)
             transcription_path = output_dir / f'{base_name}.txt'
+            self.logger.debug(f"_transcribe_audio: Saving transcription to {transcription_path}")
             with open(transcription_path, 'w', encoding='utf-8') as f:
                 for segment in aligned_result["segments"]:
                     f.write(f"[{segment['start']:.2f}s -> {segment['end']:.2f}s] {segment['text']}\n")
 
             # Save SRT file
             srt_path = output_dir / f'{base_name}.srt'
+            self.logger.debug(f"_transcribe_audio: Saving SRT to {srt_path}")
             with open(srt_path, 'w', encoding='utf-8') as f:
                 for i, segment in enumerate(aligned_result["segments"]):
                     start = str(time.strftime('%H:%M:%S', time.gmtime(segment['start']))) + f",{int((segment['start'] % 1) * 1000):03d}"
@@ -369,6 +430,7 @@ class VideoProcessor:
             
             # Save word-level JSON file
             json_path = output_dir / f'{base_name}_word_level.json'
+            self.logger.debug(f"_transcribe_audio: Saving JSON to {json_path}")
             word_level_data = []
             for segment in aligned_result["segments"]:
                 if 'words' in segment:
@@ -382,6 +444,7 @@ class VideoProcessor:
             with open(json_path, 'w', encoding='utf-8') as f:
                 json.dump(word_level_data, f, indent=4)
             
+            self.logger.debug(f"_transcribe_audio: Transcription process complete for {audio_path}")
             return {
                 'success': True,
                 'transcription_path': str(transcription_path),
@@ -392,7 +455,7 @@ class VideoProcessor:
             }
             
         except Exception as e:
-            self.logger.error(f"Error during transcription for {audio_path}: {e}", exc_info=True)
+            self.logger.error(f"_transcribe_audio: Error during transcription for {audio_path}: {e}", exc_info=True)
             return {
                 'success': False,
                 'error': str(e),
@@ -403,6 +466,7 @@ class VideoProcessor:
 
     def _save_to_drive(self, video_path: str, audio_path: str, transcription_path: str, srt_path: Optional[str] = None, json_path: Optional[str] = None) -> Dict[str, Any]:
         """Save processed files to Google Drive"""
+        self.logger.debug(f"_save_to_drive: Starting save to Drive for video: {video_path}")
         try:
             from pydrive2.auth import GoogleAuth
             from pydrive2.drive import GoogleDrive
@@ -411,32 +475,38 @@ class VideoProcessor:
             # Authenticate and create drive object
             gauth = GoogleAuth()
             # Try to load saved client credentials
+            self.logger.debug("_save_to_drive: Loading Drive credentials...")
             gauth.LoadCredentialsFile("mycreds.txt")
             if gauth.credentials is None:
                 # Authenticate if they're not there
+                self.logger.info("_save_to_drive: Authenticating with LocalWebserverAuth...")
                 gauth.LocalWebserverAuth()
             elif gauth.access_token_expired:
                 # Refresh them if expired
+                self.logger.info("_save_to_drive: Refreshing Drive credentials...")
                 gauth.Refresh()
             else:
                 # Initialize the saved creds
+                self.logger.info("_save_to_drive: Authorizing with saved Drive credentials...")
                 gauth.Authorize()
             
             gauth.SaveCredentialsFile("mycreds.txt")  # Save the current credentials to a file
             drive = GoogleDrive(gauth)
+            self.logger.debug("_save_to_drive: Google Drive authentication complete.")
             
             # Get or create base folder
             folder_title = self.config.drive_folder
+            self.logger.debug(f"_save_to_drive: Checking for Drive folder: {folder_title}")
             file_list = drive.ListFile({'q': f"'root' in parents and title='{folder_title}' and mimeType='application/vnd.google-apps.folder' and trashed=false"}).GetList()
             
             if not file_list:
                 folder = drive.CreateFile({'title': folder_title, 'mimeType': 'application/vnd.google-apps.folder'})
                 folder.Upload()
                 folder_id = folder['id']
-                self.logger.info(f"Created Google Drive folder: {folder_title}")
+                self.logger.info(f"Created Google Drive folder: {folder_title} with ID: {folder_id}")
             else:
                 folder_id = file_list[0]['id']
-                self.logger.info(f"Found Google Drive folder: {folder_title}")
+                self.logger.info(f"Found Google Drive folder: {folder_title} with ID: {folder_id}")
             
             # Create subfolders for better organization
             video_folder_id = self._get_or_create_drive_folder(drive, folder_id, 'videos')
@@ -445,6 +515,7 @@ class VideoProcessor:
 
             # Upload video file
             video_file_name = Path(video_path).name
+            self.logger.debug(f"_save_to_drive: Uploading video file: {video_file_name} to {video_folder_id}")
             video_file = drive.CreateFile({'title': video_file_name, 'parents': [{'id': video_folder_id}]})
             video_file.SetContentFile(video_path)
             video_file.Upload()
@@ -452,6 +523,7 @@ class VideoProcessor:
             
             # Upload audio file
             audio_file_name = Path(audio_path).name
+            self.logger.debug(f"_save_to_drive: Uploading audio file: {audio_file_name} to {audio_folder_id}")
             audio_file = drive.CreateFile({'title': audio_file_name, 'parents': [{'id': audio_folder_id}]})
             audio_file.SetContentFile(audio_path)
             audio_file.Upload()
@@ -459,6 +531,7 @@ class VideoProcessor:
             
             # Upload transcription file
             transcription_file_name = Path(transcription_path).name
+            self.logger.debug(f"_save_to_drive: Uploading transcription file: {transcription_file_name} to {transcription_folder_id}")
             transcription_file = drive.CreateFile({'title': transcription_file_name, 'parents': [{'id': transcription_folder_id}]})
             transcription_file.SetContentFile(transcription_path)
             transcription_file.Upload()
@@ -467,6 +540,7 @@ class VideoProcessor:
             # Upload SRT file if generated
             if srt_path:
                 srt_file_name = Path(srt_path).name
+                self.logger.debug(f"_save_to_drive: Uploading SRT file: {srt_file_name} to {transcription_folder_id}")
                 srt_file = drive.CreateFile({'title': srt_file_name, 'parents': [{'id': transcription_folder_id}]})
                 srt_file.SetContentFile(srt_path)
                 srt_file.Upload()
@@ -475,6 +549,7 @@ class VideoProcessor:
             # Upload JSON file if generated
             if json_path:
                 json_file_name = Path(json_path).name
+                self.logger.debug(f"_save_to_drive: Uploading JSON file: {json_file_name} to {transcription_folder_id}")
                 json_file = drive.CreateFile({'title': json_file_name, 'parents': [{'id': transcription_folder_id}]})
                 json_file.SetContentFile(json_path)
                 json_file.Upload()
@@ -490,26 +565,30 @@ class VideoProcessor:
                     Path(srt_path).unlink(missing_ok=True)
                 if json_path:
                     Path(json_path).unlink(missing_ok=True)
+                self.logger.debug(f"_save_to_drive: Local files cleaned up for {video_file_name}")
 
             return {'success': True}
             
         except Exception as e:
-            self.logger.error(f"Error saving to Google Drive: {e}", exc_info=True)
+            self.logger.error(f"_save_to_drive: Error saving to Google Drive: {e}", exc_info=True)
             return {'success': False, 'error': str(e)}
 
     def _get_or_create_drive_folder(self, drive, parent_id: str, folder_name: str) -> str:
         """Helper to get or create a folder in Google Drive"""
+        self.logger.debug(f"_get_or_create_drive_folder: Checking for folder '{folder_name}' under parent ID: {parent_id}")
         file_list = drive.ListFile({'q': f"'{parent_id}' in parents and title='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"}).GetList()
         if not file_list:
             folder = drive.CreateFile({'title': folder_name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [{'id': parent_id}]})
             folder.Upload()
-            self.logger.info(f"Created Google Drive subfolder: {folder_name}")
+            self.logger.info(f"Created Google Drive subfolder: {folder_name} with ID: {folder['id']}")
             return folder['id']
         else:
+            self.logger.debug(f"_get_or_create_drive_folder: Found existing folder: {folder_name} with ID: {file_list[0]['id']}")
             return file_list[0]['id']
     
     def _handle_processing_error(self, video_item: Dict[str, Any], error: Exception):
         """Handle processing errors"""
+        self.logger.error(f"_handle_processing_error: Handling error for video {video_item['url']}")
         # Use intelligent error handler
         context = {
             'video_url': video_item['url'],
@@ -518,11 +597,12 @@ class VideoProcessor:
         }
         
         error_result = self.error_handler.handle_error(error, context)
+        self.logger.debug(f"_handle_processing_error: Error handler result: {error_result}")
         
         # Create failed result
         result = ProcessingResult(
             video_url=video_item['url'],
-            video_title='Unknown',
+            video_title='Unknown', # Title might not be available on failure
             download_path='',
             audio_path='',
             transcription_path='',
@@ -539,11 +619,12 @@ class VideoProcessor:
         
         with self.lock:
             self.failed_results.append(result)
-    
+        self.logger.info(f"_handle_processing_error: Video {video_item['url']} marked as failed.")
+
     def get_status(self) -> Dict[str, Any]:
         """Get current processing status"""
         with self.lock:
-            return {
+            status = {
                 'queue_length': len(self.processing_queue),
                 'active_processes': len(self.active_processes),
                 'completed_count': len(self.completed_results),
@@ -553,20 +634,25 @@ class VideoProcessor:
                 'resource_status': self.resource_monitor.get_resource_summary(),
                 'error_statistics': self.error_handler.get_error_statistics()
             }
-    
+            self.logger.debug(f"get_status: Current status: {status}")
+            return status
+
     def get_results(self) -> Dict[str, List[ProcessingResult]]:
         """Get processing results"""
         with self.lock:
-            return {
+            results = {
                 'completed': self.completed_results.copy(),
                 'failed': self.failed_results.copy()
             }
+            self.logger.debug(f"get_results: Returning results. Completed: {len(results['completed'])}, Failed: {len(results['failed'])}")
+            return results
     
     def clear_results(self):
         """Clear processing results"""
         with self.lock:
             self.completed_results.clear()
             self.failed_results.clear()
+            self.logger.info("Cleared all processing results.")
     
     def get_recommendations(self) -> List[str]:
         """Get system recommendations"""
@@ -580,5 +666,5 @@ class VideoProcessor:
         resource_warnings = self.resource_monitor.get_resource_warnings()
         if resource_warnings:
             recommendations.extend(resource_warnings)
-        
+        self.logger.debug(f"get_recommendations: Current recommendations: {recommendations}")
         return recommendations 
