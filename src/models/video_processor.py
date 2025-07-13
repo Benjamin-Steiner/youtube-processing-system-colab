@@ -151,16 +151,22 @@ class VideoProcessor:
     def _processing_worker(self, worker_id: int):
         """Worker thread for processing videos"""
         self.logger.info(f"Worker {worker_id} started")
+        self.logger.debug(f"_processing_worker {worker_id}: Entering main loop.")
         
         while not self.should_stop:
+            self.logger.debug(f"_processing_worker {worker_id}: Checking queue. Current queue length: {len(self.processing_queue)}")
             # Get next video from queue
             video_item = self._get_next_video()
             if not video_item:
+                self.logger.debug(f"_processing_worker {worker_id}: No video in queue, sleeping.")
                 time.sleep(1.0)
                 continue
             
+            self.logger.debug(f"_processing_worker {worker_id}: Retrieved video: {video_item.get('url')}")
+            
             # Start processing
             if self.concurrency_manager.start_process(video_item['url']):
+                self.logger.info(f"_processing_worker {worker_id}: Concurrency manager approved, starting process for {video_item['url']}")
                 try:
                     self._process_video(video_item, worker_id)
                 except Exception as e:
@@ -168,20 +174,31 @@ class VideoProcessor:
                     self._handle_processing_error(video_item, e)
                 finally:
                     self.concurrency_manager.finish_process(video_item['url'])
+                    self.logger.info(f"_processing_worker {worker_id}: Finished process for {video_item['url']}")
+            else:
+                self.logger.warning(f"_processing_worker {worker_id}: Concurrency manager denied starting process for {video_item['url']}. Re-queuing.")
+                # If concurrency manager denies, re-add to queue (or handle based on strategy)
+                with self.lock:
+                    self.processing_queue.append(video_item)
+                time.sleep(1.0) # Small delay before retrying
         
         self.logger.info(f"Worker {worker_id} stopped")
     
     def _get_next_video(self) -> Optional[Dict[str, Any]]:
         """Get next video from queue"""
+        self.logger.debug("_get_next_video: Attempting to get next video.")
         with self.lock:
             if not self.processing_queue:
+                self.logger.debug("_get_next_video: Queue is empty, returning None.")
                 return None
             
             # Sort by priority
             priority_order = {'high': 0, 'normal': 1, 'low': 2}
             self.processing_queue.sort(key=lambda x: priority_order.get(x['priority'], 1))
             
-            return self.processing_queue.pop(0)
+            video_item = self.processing_queue.pop(0)
+            self.logger.debug(f"_get_next_video: Retrieved video {video_item.get('url')}. New queue length: {len(self.processing_queue)}")
+            return video_item
     
     def _process_video(self, video_item: Dict[str, Any], worker_id: int):
         """Process a single video"""
