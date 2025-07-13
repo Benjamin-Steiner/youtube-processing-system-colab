@@ -11,10 +11,10 @@ from dataclasses import dataclass
 from pathlib import Path
 import json
 
-from ..core.concurrency_manager import HybridConcurrencyManager, ConcurrencyConfig, ProcessingMode
-from ..utils.resource_monitor import ResourceMonitor
-from ..optimization.memory_manager import HybridMemoryManager, MemoryConfig, MemoryStrategy
-from ..handlers.error_handler import IntelligentErrorHandler
+from src.core.concurrency_manager import HybridConcurrencyManager, ConcurrencyConfig, ProcessingMode
+from src.utils.resource_monitor import ResourceMonitor
+from src.optimization.memory_manager import HybridMemoryManager, MemoryConfig, MemoryStrategy
+from src.handlers.error_handler import IntelligentErrorHandler
 
 
 @dataclass
