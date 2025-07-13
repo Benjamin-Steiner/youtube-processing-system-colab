@@ -11,7 +11,7 @@ from enum import Enum
 import logging
 
 from ..utils.resource_monitor import ResourceMonitor
-from ..optimization.memory_manager import MemoryManager
+from ..optimization.memory_manager import HybridMemoryManager, MemoryConfig
 
 
 class ProcessingMode(Enum):
@@ -47,7 +47,7 @@ class HybridConcurrencyManager:
         
         # Initialize components
         self.resource_monitor = ResourceMonitor()
-        self.memory_manager = MemoryManager()
+        self.memory_manager = HybridMemoryManager(MemoryConfig())
         
         # Threading for background monitoring
         self.monitoring_thread = None
