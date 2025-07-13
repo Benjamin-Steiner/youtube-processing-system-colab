@@ -26,7 +26,7 @@ class ProcessingConfig:
     output_dir: str = './downloads'
     
     # Transcription settings
-    whisper_model: str = 'large-v2'
+    whisper_model: str = 'distil-large-v3'
     compute_type: str = 'float16'
     language: Optional[str] = None
     task: str = 'transcribe'
@@ -49,6 +49,8 @@ class ProcessingResult:
     download_path: str
     audio_path: str
     transcription_path: str
+    srt_path: Optional[str] = None
+    json_path: Optional[str] = None
     processing_time: float
     success: bool
     error_message: Optional[str] = None
@@ -209,7 +211,9 @@ class VideoProcessor:
                 drive_result = self._save_to_drive(
                     download_result['video_path'],
                     audio_result['audio_path'],
-                    transcription_result['transcription_path']
+                    transcription_result['transcription_path'],
+                    transcription_result.get('srt_path'),
+                    transcription_result.get('json_path')
                 )
             
             # Create result
@@ -220,6 +224,8 @@ class VideoProcessor:
                 download_path=download_result['video_path'],
                 audio_path=audio_result['audio_path'],
                 transcription_path=transcription_result['transcription_path'],
+                srt_path=transcription_result.get('srt_path'),
+                json_path=transcription_result.get('json_path'),
                 processing_time=processing_time,
                 success=True,
                 metadata={
@@ -303,62 +309,204 @@ class VideoProcessor:
             }
     
     def _transcribe_audio(self, audio_path: str) -> Dict[str, Any]:
-        """Transcribe audio using Faster-Whisper"""
+        """Transcribe audio using WhisperX and generate SRT/JSON with alignment"""
         try:
-            from faster_whisper import WhisperModel
+            import torch # Import torch here for multithreaded context
+            import whisperx
+            import gc
             
-            # Load model (with caching)
-            model = self.memory_manager.model_cache.load_model(
-                self.config.whisper_model,
-                self.config.compute_type
-            )
+            # Load Whisper model
+            # Using smaller model for alignment is often sufficient and faster
+            whisper_model_name = "base" # This can be configured if needed
+            whisper_batch_size = 8 # This can be configured if needed
             
-            if not model:
-                raise Exception("Failed to load Whisper model")
+            self.logger.info(f"Loading WhisperX model: {whisper_model_name} on device: cuda, compute_type: {self.config.compute_type}")
+            model = whisperx.load_model(whisper_model_name, "cuda", compute_type=self.config.compute_type)
+
+            # Load audio
+            audio = whisperx.load_audio(audio_path)
+
+            # Transcribe audio
+            self.logger.info("Transcribing audio with WhisperX...")
+            result = model.transcribe(audio, batch_size=whisper_batch_size, language=self.config.language)
             
-            # Transcribe
-            segments, info = model.transcribe(
-                audio_path,
-                language=self.config.language,
-                task=self.config.task
-            )
+            # Clear whisper model from GPU memory
+            del model
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # Load alignment model and metadata
+            self.logger.info(f"Loading alignment model for language: {result['language']}")
+            align_model, metadata = whisperx.load_align_model(language_code=result['language'], device="cuda")
+
+            # Align word timestamps
+            self.logger.info("Aligning word timestamps...")
+            aligned_result = whisperx.align(result["segments"], align_model, metadata, audio, "cuda", return_char_alignments=False)
             
-            # Save transcription
-            transcription_path = audio_path.replace('.wav', '_transcription.txt')
+            # Clear alignment model from GPU memory
+            del align_model
+            gc.collect()
+            torch.cuda.empty_cache()
             
+            base_name = Path(audio_path).stem
+            output_dir = Path(self.config.output_dir)
+            
+            # Save transcription (text)
+            transcription_path = output_dir / f'{base_name}.txt'
             with open(transcription_path, 'w', encoding='utf-8') as f:
-                for segment in segments:
-                    f.write(f"[{segment.start:.2f}s -> {segment.end:.2f}s] {segment.text}\n")
+                for segment in aligned_result["segments"]:
+                    f.write(f"[{segment['start']:.2f}s -> {segment['end']:.2f}s] {segment['text']}\n")
+
+            # Save SRT file
+            srt_path = output_dir / f'{base_name}.srt'
+            with open(srt_path, 'w', encoding='utf-8') as f:
+                for i, segment in enumerate(aligned_result["segments"]):
+                    start = str(time.strftime('%H:%M:%S', time.gmtime(segment['start']))) + f",{int((segment['start'] % 1) * 1000):03d}"
+                    end = str(time.strftime('%H:%M:%S', time.gmtime(segment['end']))) + f",{int((segment['end'] % 1) * 1000):03d}"
+                    f.write(f"{i + 1}\n")
+                    f.write(f"{start} --> {end}\n")
+                    f.write(f"{segment['text'].strip()}\n\n")
+            
+            # Save word-level JSON file
+            json_path = output_dir / f'{base_name}_word_level.json'
+            word_level_data = []
+            for segment in aligned_result["segments"]:
+                if 'words' in segment:
+                    for word in segment['words']:
+                        word_level_data.append({
+                            'word': word['word'],
+                            'start': word['start'],
+                            'end': word['end'],
+                            'score': word.get('score', 0.0) # score might not always be present
+                        })
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(word_level_data, f, indent=4)
             
             return {
                 'success': True,
-                'transcription_path': transcription_path,
-                'language': info.language,
-                'language_probability': info.language_probability
+                'transcription_path': str(transcription_path),
+                'srt_path': str(srt_path),
+                'json_path': str(json_path),
+                'language': result['language'],
+                'language_probability': result['language_probability']
             }
             
         except Exception as e:
+            self.logger.error(f"Error during transcription for {audio_path}: {e}", exc_info=True)
             return {
                 'success': False,
-                'error': str(e)
+                'error': str(e),
+                'transcription_path': None,
+                'srt_path': None,
+                'json_path': None
             }
-    
-    def _save_to_drive(self, video_path: str, audio_path: str, transcription_path: str) -> Dict[str, Any]:
-        """Save files to Google Drive"""
+
+    def _save_to_drive(self, video_path: str, audio_path: str, transcription_path: str, srt_path: Optional[str] = None, json_path: Optional[str] = None) -> Dict[str, Any]:
+        """Save processed files to Google Drive"""
         try:
-            # This would implement Google Drive integration
-            # For now, just return success
-            self.logger.info(f"Files saved to Google Drive: {video_path}, {audio_path}, {transcription_path}")
+            from pydrive2.auth import GoogleAuth
+            from pydrive2.drive import GoogleDrive
+            import shutil
             
-            return {
-                'success': True
-            }
+            # Authenticate and create drive object
+            gauth = GoogleAuth()
+            # Try to load saved client credentials
+            gauth.LoadCredentialsFile("mycreds.txt")
+            if gauth.credentials is None:
+                # Authenticate if they're not there
+                gauth.LocalWebserverAuth()
+            elif gauth.access_token_expired:
+                # Refresh them if expired
+                gauth.Refresh()
+            else:
+                # Initialize the saved creds
+                gauth.Authorize()
+            
+            gauth.SaveCredentialsFile("mycreds.txt")  # Save the current credentials to a file
+            drive = GoogleDrive(gauth)
+            
+            # Get or create base folder
+            folder_title = self.config.drive_folder
+            file_list = drive.ListFile({'q': f"'root' in parents and title='{folder_title}' and mimeType='application/vnd.google-apps.folder' and trashed=false"}).GetList()
+            
+            if not file_list:
+                folder = drive.CreateFile({'title': folder_title, 'mimeType': 'application/vnd.google-apps.folder'})
+                folder.Upload()
+                folder_id = folder['id']
+                self.logger.info(f"Created Google Drive folder: {folder_title}")
+            else:
+                folder_id = file_list[0]['id']
+                self.logger.info(f"Found Google Drive folder: {folder_title}")
+            
+            # Create subfolders for better organization
+            video_folder_id = self._get_or_create_drive_folder(drive, folder_id, 'videos')
+            audio_folder_id = self._get_or_create_drive_folder(drive, folder_id, 'audio')
+            transcription_folder_id = self._get_or_create_drive_folder(drive, folder_id, 'transcriptions')
+
+            # Upload video file
+            video_file_name = Path(video_path).name
+            video_file = drive.CreateFile({'title': video_file_name, 'parents': [{'id': video_folder_id}]})
+            video_file.SetContentFile(video_path)
+            video_file.Upload()
+            self.logger.info(f"Uploaded video to Drive: {video_file_name}")
+            
+            # Upload audio file
+            audio_file_name = Path(audio_path).name
+            audio_file = drive.CreateFile({'title': audio_file_name, 'parents': [{'id': audio_folder_id}]})
+            audio_file.SetContentFile(audio_path)
+            audio_file.Upload()
+            self.logger.info(f"Uploaded audio to Drive: {audio_file_name}")
+            
+            # Upload transcription file
+            transcription_file_name = Path(transcription_path).name
+            transcription_file = drive.CreateFile({'title': transcription_file_name, 'parents': [{'id': transcription_folder_id}]})
+            transcription_file.SetContentFile(transcription_path)
+            transcription_file.Upload()
+            self.logger.info(f"Uploaded transcription to Drive: {transcription_file_name}")
+
+            # Upload SRT file if generated
+            if srt_path:
+                srt_file_name = Path(srt_path).name
+                srt_file = drive.CreateFile({'title': srt_file_name, 'parents': [{'id': transcription_folder_id}]})
+                srt_file.SetContentFile(srt_path)
+                srt_file.Upload()
+                self.logger.info(f"Uploaded SRT to Drive: {srt_file_name}")
+
+            # Upload JSON file if generated
+            if json_path:
+                json_file_name = Path(json_path).name
+                json_file = drive.CreateFile({'title': json_file_name, 'parents': [{'id': transcription_folder_id}]})
+                json_file.SetContentFile(json_path)
+                json_file.Upload()
+                self.logger.info(f"Uploaded JSON to Drive: {json_file_name}")
+            
+            # Clean up local files
+            if self.config.auto_cleanup:
+                self.logger.info(f"Cleaning up local files for {video_file_name}")
+                Path(video_path).unlink(missing_ok=True)
+                Path(audio_path).unlink(missing_ok=True)
+                Path(transcription_path).unlink(missing_ok=True)
+                if srt_path:
+                    Path(srt_path).unlink(missing_ok=True)
+                if json_path:
+                    Path(json_path).unlink(missing_ok=True)
+
+            return {'success': True}
             
         except Exception as e:
-            return {
-                'success': False,
-                'error': str(e)
-            }
+            self.logger.error(f"Error saving to Google Drive: {e}", exc_info=True)
+            return {'success': False, 'error': str(e)}
+
+    def _get_or_create_drive_folder(self, drive, parent_id: str, folder_name: str) -> str:
+        """Helper to get or create a folder in Google Drive"""
+        file_list = drive.ListFile({'q': f"'{parent_id}' in parents and title='{folder_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"}).GetList()
+        if not file_list:
+            folder = drive.CreateFile({'title': folder_name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [{'id': parent_id}]})
+            folder.Upload()
+            self.logger.info(f"Created Google Drive subfolder: {folder_name}")
+            return folder['id']
+        else:
+            return file_list[0]['id']
     
     def _handle_processing_error(self, video_item: Dict[str, Any], error: Exception):
         """Handle processing errors"""
@@ -378,6 +526,8 @@ class VideoProcessor:
             download_path='',
             audio_path='',
             transcription_path='',
+            srt_path=None,
+            json_path=None,
             processing_time=0.0,
             success=False,
             error_message=str(error),

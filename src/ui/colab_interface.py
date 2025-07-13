@@ -8,7 +8,7 @@ import logging
 from typing import Dict, List, Any
 from IPython.display import display, HTML, clear_output
 import ipywidgets as widgets
-from ipywidgets import Layout, VBox, HBox, Label, Button, Text, Dropdown, IntSlider, Checkbox, Output, Progress
+from ipywidgets import Layout, VBox, HBox, Label, Button, Text, Dropdown, IntSlider, Checkbox, Output
 
 from ..models.video_processor import VideoProcessor, ProcessingConfig
 
@@ -345,7 +345,8 @@ class ColabSetup:
             'soundfile',
             'ipywidgets',
             'GPUtil',
-            'psutil'
+            'psutil',
+            'whisperx'
         ]
         
         for package in packages:
