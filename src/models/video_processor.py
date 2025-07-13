@@ -49,12 +49,12 @@ class ProcessingResult:
     download_path: str
     audio_path: str
     transcription_path: str
-    srt_path: Optional[str] = None
-    json_path: Optional[str] = None
     processing_time: float
     success: bool
     error_message: Optional[str] = None
     metadata: Dict[str, Any] = None
+    srt_path: Optional[str] = None
+    json_path: Optional[str] = None
 
 
 class VideoProcessor:
